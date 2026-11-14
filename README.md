@@ -1,5 +1,9 @@
 # 📖 README — LPE-Scanner
 
+<p align="center">
+  <img src="./image.png" alt="LPE-Scanner banner" width="100%">
+</p>
+
 # LPE-Scanner (LinPEAS-Lite)
 
 **An advanced, single-file Linux privilege escalation scanner written in Bash.**

